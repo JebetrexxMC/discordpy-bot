@@ -413,7 +413,10 @@ class AuthCore:
                 return {"ok": 0, "err": "Username: 3-20 letters, numbers or _"}
             if not (6 <= len(pw) <= 32):
                 return {"ok": 0, "err": "Password: 6-32 characters"}
-            if gender not in GENDERS:
+            # 4.13.21: Moquil / Textdraw Editor sent "male"/"female" (lowercase) -> "Pick a gender"
+            # even with a gender picked. Accept any case, store the canonical name.
+            gender = next((g for g in GENDERS if g.lower() == str(gender or "").strip().lower()), "")
+            if not gender:
                 return {"ok": 0, "err": "Pick a gender"}
             if not age.isdigit() or not (10 <= int(age) <= 99):
                 return {"ok": 0, "err": "Age: 10-99"}

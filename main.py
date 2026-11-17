@@ -37,7 +37,7 @@ import paho.mqtt.client as mqtt
 
 from authcore import AuthCore, TOPIC_REQ, TOPIC_RES
 
-VERSION = "4.13.20"
+VERSION = "4.13.21"
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("mpbot")
 
