@@ -6,7 +6,9 @@
   /create     - 5.00.05: make a game account right here: /create user: pass: gender: age: (only you see it);
                 saved to your Discord like a game sign up (max 3 per Discord)
   auto reply  - 5.00.05: "how do I make an account?" in any channel -> a public answer (14 variants) pointing to
-                the create channel (CREATE_CHANNEL_ID, default 1563160216286003272). Needs the Message Content intent
+                the create channel (CREATE_CHANNEL_ID, default 1563160216286003272). Needs the Message Content intent.
+                Quiet when they say it's done ("account created", "tapos na", "already have one") or already have
+                an account (then only "another / new account" gets an answer: /create, or /delete at the limit)
   /delete     - 5.00.05: delete one of your game accounts (form, type DELETE), then /create a new one
   /forgotuser - 3.56: shows the game username(s) of your Discord + the phones logged in to them (5.00.05),
                 and rewrites MP/accounts.txt + auth_service.txt on those phones (made again if they were deleted)
@@ -474,7 +476,19 @@ CREATE_REPLIES = [
 _ASK = re.compile(r"\b(how|paano|pano|panu|unsaon|unsay|unsa|asa|saan|where|can\s*i|pwede|help|pls|please|tulong|what|wat)\b", re.I)
 _MAKE = re.compile(r"\b(create|creating|make|making|register|registration|sign\s*-?\s*up|gawa|gumawa|maggawa|himo|maghimo|buhat|mag\s*create|open|new|bago)\b", re.I)
 _ACC = re.compile(r"\b(acc|accs|account|accounts|acct|akawnt|akaun|user\s*name|username)\b", re.I)
-_last_reply = {"ch": {}, "user": {}, "i": -1}
+# "it's done": the account is already made -> no reply (and that person is left alone from then on)
+_DONE = re.compile(r"\b(done|created|made|finished|finally|success(ful)?|registered|worked|working\s*now|logged\s*in|"
+                   r"already\s*(have|got|made|created|done)|i\s*(have|got)\s*(an?\s*|my\s*)?acc|"
+                   r"tapos\s*na|nagawa\s*ko|nakagawa|okay\s*na|ok\s*na|goods\s*na|gumana|human\s*na|nahimo|na\s*himo|"
+                   r"thanks?|thank\s*you|salamat|ty)\b", re.I)
+_NOT_DONE = re.compile(r"\b(not|n't|cant|can't|cannot|unable|di|dili|wala|hindi|failed|error|why)\b", re.I)
+_last_reply = {"ch": {}, "user": {}, "i": -1, "done": set()}
+
+
+def _says_done(text):
+    """'my account is done', 'already made one', 'tapos na', 'thanks it worked' - but not 'can't create' / 'not done'."""
+    t = text or ""
+    return bool(_DONE.search(t)) and not _NOT_DONE.search(t)
 
 
 def _is_create_question(text):
@@ -493,7 +507,16 @@ async def on_message(msg: discord.Message):
         return
     if str(msg.channel.id) == CREATE_CHANNEL:
         return
-    if not _is_create_question(msg.content):
+    text = msg.content or ""
+    if _says_done(text) and (_ACC.search(text) or _MAKE.search(text) or msg.author.id in _last_reply["user"]):
+        _last_reply["done"].add(msg.author.id)   # their account is made: no more "go to the channel" for them
+        return
+    if msg.author.id in _last_reply["done"] or not _is_create_question(text):
+        return
+    # already has a game account (the bot knows it): only answer when they ask for another / a new one
+    has = await asyncio.to_thread(core.accounts_by_discord, msg.author.id)
+    wants_more = re.search(r"\b(another|new|second|2nd|third|3rd|bago|lain|isa\s*pa)\b", text, re.I)
+    if has and not wants_more:
         return
     now = time.time()
     if now - _last_reply["ch"].get(msg.channel.id, 0) < 60 or now - _last_reply["user"].get(msg.author.id, 0) < 300:
@@ -504,8 +527,14 @@ async def on_message(msg: discord.Message):
     if i == _last_reply["i"]:
         i = (i + 1) % len(CREATE_REPLIES)
     _last_reply["i"] = i
+    text_out = CREATE_REPLIES[i]
+    if has:
+        n = len(has)
+        text_out = (f"You already have {n}/{MAX_ACCOUNTS} account{'s' if n > 1 else ''}. "
+                    + (f"Make another in {_CH} with `/create user: pass: gender: age:`." if n < MAX_ACCOUNTS else
+                       f"That's the limit - in {_CH} use `/delete` first, then `/create` a new one."))
     try:
-        await msg.reply(CREATE_REPLIES[i], mention_author=False)
+        await msg.reply(text_out, mention_author=False)
         log.info("auto reply (create account) to %s in #%s", msg.author, getattr(msg.channel, "name", msg.channel.id))
     except discord.HTTPException as e:
         log.warning("auto reply: %s", e)
