@@ -7,8 +7,9 @@
                 saved to your Discord like a game sign up (max 3 per Discord)
   auto reply  - 5.00.05: "how do I make an account?" in any channel -> a public answer (14 variants) pointing to
                 the create channel (CREATE_CHANNEL_ID, default 1563160216286003272). Needs the Message Content intent.
-                Quiet when they say it's done ("account created", "tapos na", "already have one") or already have
-                an account (then only "another / new account" gets an answer: /create, or /delete at the limit)
+                Answers "how to create account" and "how to create new account" alike; quiet when they say it's
+                done ("account created", "tapos na", "already have one"). People with accounts get /create or
+                /delete (at the limit) in the answer. 30 s per channel, 2 min per person
   /delete     - 5.00.05: delete one of your game accounts (form, type DELETE), then /create a new one
   /forgotuser - 3.56: shows the game username(s) of your Discord + the phones logged in to them (5.00.05),
                 and rewrites MP/accounts.txt + auth_service.txt on those phones (made again if they were deleted)
@@ -482,7 +483,7 @@ _DONE = re.compile(r"\b(done|created|made|finished|finally|success(ful)?|registe
                    r"tapos\s*na|nagawa\s*ko|nakagawa|okay\s*na|ok\s*na|goods\s*na|gumana|human\s*na|nahimo|na\s*himo|"
                    r"thanks?|thank\s*you|salamat|ty)\b", re.I)
 _NOT_DONE = re.compile(r"\b(not|n't|cant|can't|cannot|unable|di|dili|wala|hindi|failed|error|why)\b", re.I)
-_last_reply = {"ch": {}, "user": {}, "i": -1, "done": set()}
+_last_reply = {"ch": {}, "user": {}, "i": -1, "done": {}}
 # live check for the status page: messages seen / with text (0 with text = Message Content not arriving), replies
 AUTO_STATS = {"seen": 0, "text": 0, "replies": 0, "last": 0, "portal": None}
 
@@ -514,17 +515,15 @@ async def on_message(msg: discord.Message):
         return
     text = msg.content or ""
     if _says_done(text) and (_ACC.search(text) or _MAKE.search(text) or msg.author.id in _last_reply["user"]):
-        _last_reply["done"].add(msg.author.id)   # their account is made: no more "go to the channel" for them
+        _last_reply["done"][msg.author.id] = time.time()   # their account is made: quiet for them for 10 min
         return
-    if msg.author.id in _last_reply["done"] or not _is_create_question(text):
+    if time.time() - _last_reply["done"].get(msg.author.id, 0) < 600 or not _is_create_question(text):
         return
-    # already has a game account (the bot knows it): only answer when they ask for another / a new one
+    # "how to create account" / "how to create new account": always answered; somebody who already has a game
+    # account gets told how many they have and how to make another (/create, or /delete first at the limit)
     has = await asyncio.to_thread(core.accounts_by_discord, msg.author.id)
-    wants_more = re.search(r"\b(another|new|second|2nd|third|3rd|bago|lain|isa\s*pa)\b", text, re.I)
-    if has and not wants_more:
-        return
     now = time.time()
-    if now - _last_reply["ch"].get(msg.channel.id, 0) < 60 or now - _last_reply["user"].get(msg.author.id, 0) < 300:
+    if now - _last_reply["ch"].get(msg.channel.id, 0) < 30 or now - _last_reply["user"].get(msg.author.id, 0) < 120:
         return
     _last_reply["ch"][msg.channel.id] = _last_reply["user"][msg.author.id] = now
     import random
