@@ -371,6 +371,29 @@ class AuthCore:
                 out.append((a, [{"id": r[0][:6], "app": r[1] or "game", "first": r[2], "last": r[3], "logins": r[4]} for r in rows]))
             return out, self._pushes_for(discord_id)
 
+    def all_accounts(self, query="", discord_id=None):
+        """5.01.03 /check (staff): every game account with its Discord + phone count, newest login first.
+        query = part of the game username or the saved Discord name; discord_id = only that Discord.
+        No password data leaves this function."""
+        with self.lock:
+            sql = ("SELECT a.user, a.discord_id, a.discord_name, a.gender, a.age, a.created, a.last_login, a.logins, "
+                   "a.last_server, (SELECT COUNT(*) FROM devices d WHERE d.user_lc = a.user_lc), "
+                   "(SELECT MAX(last_seen) FROM devices d WHERE d.user_lc = a.user_lc) FROM accounts a")
+            where, args = [], []
+            if discord_id:
+                where.append("a.discord_id = ?"); args.append(str(discord_id))
+            q = (query or "").strip().lower()
+            if q:
+                like = "%" + q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"   # "_" is common in names
+                where.append("(a.user_lc LIKE ? ESCAPE '\\' OR LOWER(a.discord_name) LIKE ? ESCAPE '\\' OR a.discord_id = ?)")
+                args += [like, like, q]
+            if where:
+                sql += " WHERE " + " AND ".join(where)
+            sql += " ORDER BY a.last_login DESC, a.created DESC"
+            keys = ("user", "discord_id", "discord_name", "gender", "age", "created", "last_login", "logins",
+                    "last_server", "phones", "phone_seen")
+            return [dict(zip(keys, r)) for r in self.db.execute(sql, args).fetchall()]
+
     # ---------------------------------------------------------------- 5.00.05: phone registry + saved login sync
     def _register_dev_key(self, dk, user_lc, discord_id, app=""):
         t = _now()

@@ -17,6 +17,8 @@
                 (a new saved login goes to their MP/auth_service.txt). /resetpass = the same form
   /streaming on|off - 4.13.16: (server managers) the bot joins a voice channel and plays the YouTube live 24/7
   /changelog  - 4.13.20: (server managers) posts the mod release changelog (wagu docs/discord/changelog.md) with @everyone
+  /check      - 5.01.03: (only the CHECK_ROLE_ID role, default 1562343934590713937) every MP game account with its
+                Discord username: all, one member: or search: (MP name / Discord name / id); pages + CSV, only you see it
 
 Settings are environment variables, never put them in the code or in git:
   DISCORD_TOKEN     the bot token (Discord Developer Portal -> Bot -> Reset Token)
@@ -30,6 +32,7 @@ Settings are environment variables, never put them in the code or in git:
   MP_RAILWAY_HOST   optional: name shown on the website's Railway page (default "MP Railway")
   VOICE_STREAM_URL  optional: the YouTube live /streaming plays (default the MP live below)
   YT_COOKIES        optional: path to a cookies.txt when YouTube asks the server to "sign in"
+  CHECK_ROLE_ID     optional: the role that may use /check (default 1562343934590713937)
 
 On MP Railway:   sudo mp-railway setup        (asks for the two keys, deploys, starts, 24/7)
 """
@@ -51,7 +54,7 @@ import paho.mqtt.client as mqtt
 from authcore import AuthCore, TOPIC_REQ, TOPIC_RES, MAX_ACCOUNTS
 from ghstore import GhStore
 
-VERSION = "5.00.05"
+VERSION = "5.01.03"
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("mpbot")
 
@@ -752,6 +755,136 @@ def _fetch_changelog() -> str:
     req = urllib.request.Request(CHANGELOG_URL + "?t=" + str(int(time.time())), headers={"User-Agent": "mpbot", "Cache-Control": "no-cache"})
     with urllib.request.urlopen(req, timeout=15) as r:
         return r.read().decode("utf-8").strip()
+
+
+# 5.01.03: /check - (staff role only) every MP game account with the Discord it belongs to. Only members with the
+# CHECK_ROLE_ID role (default 1562343934590713937) can use it; everybody else gets "no permission". The answer is
+# only shown to the one who asked (no passwords, no phone ids), with pages and a CSV download.
+CHECK_ROLE_ID = int(os.environ.get("CHECK_ROLE_ID", "1562343934590713937") or 0)
+CHECK_PAGE = 10
+
+
+def _has_check_role(inter: discord.Interaction) -> bool:
+    roles = getattr(inter.user, "roles", None) or []
+    return any(r.id == CHECK_ROLE_ID for r in roles)
+
+
+def _discord_label(a: dict, users: dict) -> str:
+    u = users.get(a["discord_id"])
+    now = f"@{u.name}" if u else None
+    saved = a["discord_name"] or "?"
+    if now and now.lstrip("@").lower() != saved.lstrip("@").lower():
+        return f"<@{a['discord_id']}> {now} (was {saved})"
+    return f"<@{a['discord_id']}> {now or saved}"
+
+
+async def _resolve_users(inter: discord.Interaction, rows):
+    """Current Discord usernames for one page (member cache first, then the API)."""
+    out = {}
+    for a in rows:
+        did = a["discord_id"]
+        if did in out:
+            continue
+        u = None
+        try:
+            n = int(did)
+            u = (inter.guild.get_member(n) if inter.guild else None) or client.get_user(n)
+            if u is None:
+                u = await client.fetch_user(n)
+        except Exception:
+            u = None
+        out[did] = u
+    return out
+
+
+async def check_embed(inter: discord.Interaction, rows, page: int, title: str) -> discord.Embed:
+    pages = max(1, (len(rows) + CHECK_PAGE - 1) // CHECK_PAGE)
+    page = max(0, min(pages - 1, page))
+    part = rows[page * CHECK_PAGE:(page + 1) * CHECK_PAGE]
+    users = await _resolve_users(inter, part)
+    discords = len({a["discord_id"] for a in rows})
+    e = discord.Embed(title=title, color=0xD7263D,
+                      description=f"**{len(rows)}** game account(s) on **{discords}** Discord account(s)" if rows else "No account found.")
+    for i, a in enumerate(part, start=page * CHECK_PAGE + 1):
+        phones = f"{a['phones']} phone(s)" + (f", seen {_ago(a['phone_seen'])}" if a.get("phone_seen") else "")
+        e.add_field(name=f"{i}. {a['user']}", inline=False,
+                    value=(f"Discord: {_discord_label(a, users)}\n"
+                           f"Created {_ago(a['created'])} · last login {_ago(a['last_login'])} · {a['logins']} login(s)\n"
+                           f"{a['gender']}, {a['age']} · {phones}" + (f" · last server {a['last_server']}" if a.get("last_server") else "")))
+    e.set_footer(text=f"Page {page + 1}/{pages} · MP bot {VERSION} · only you see this")
+    return e
+
+
+def _check_csv(rows) -> discord.File:
+    import csv
+    import io
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["mp_username", "discord_id", "discord_name", "gender", "age", "created_utc", "last_login_utc", "logins", "phones", "last_server"])
+    iso = lambda t: datetime.datetime.fromtimestamp(int(t), datetime.timezone.utc).strftime("%Y-%m-%d %H:%M") if t else ""
+    for a in rows:
+        w.writerow([a["user"], a["discord_id"], a["discord_name"], a["gender"], a["age"], iso(a["created"]), iso(a["last_login"]),
+                    a["logins"], a["phones"], a.get("last_server") or ""])
+    return discord.File(io.BytesIO(buf.getvalue().encode("utf-8")), filename="mp_accounts.csv")
+
+
+class CheckView(discord.ui.View):
+    def __init__(self, owner_id: int, rows, title: str):
+        super().__init__(timeout=900)
+        self.owner_id, self.rows, self.title, self.page = owner_id, rows, title, 0
+        self._fix()
+
+    def _fix(self):
+        pages = max(1, (len(self.rows) + CHECK_PAGE - 1) // CHECK_PAGE)
+        self.prev.disabled = self.page == 0
+        self.next.disabled = self.page >= pages - 1
+
+    async def _go(self, inter: discord.Interaction, d: int):
+        if inter.user.id != self.owner_id or not _has_check_role(inter):
+            await inter.response.send_message("You don't have permission to use /check.", ephemeral=True)
+            return
+        pages = max(1, (len(self.rows) + CHECK_PAGE - 1) // CHECK_PAGE)
+        self.page = max(0, min(pages - 1, self.page + d))
+        self._fix()
+        await inter.response.edit_message(embed=await check_embed(inter, self.rows, self.page, self.title), view=self)
+
+    @discord.ui.button(label="Back", style=discord.ButtonStyle.secondary)
+    async def prev(self, inter: discord.Interaction, button: discord.ui.Button):
+        await self._go(inter, -1)
+
+    @discord.ui.button(label="Next", style=discord.ButtonStyle.primary)
+    async def next(self, inter: discord.Interaction, button: discord.ui.Button):
+        await self._go(inter, 1)
+
+    @discord.ui.button(label="Download CSV", style=discord.ButtonStyle.success)
+    async def csv(self, inter: discord.Interaction, button: discord.ui.Button):
+        if inter.user.id != self.owner_id or not _has_check_role(inter):
+            await inter.response.send_message("You don't have permission to use /check.", ephemeral=True)
+            return
+        await inter.response.send_message(f"{len(self.rows)} account(s):", file=_check_csv(self.rows), ephemeral=True)
+
+
+@tree.command(name="check", description="Check every MP account and its Discord username (staff role only)")
+@app_commands.describe(member="only the game accounts of this Discord member",
+                       search="part of an MP username, a Discord name or a Discord id")
+@app_commands.guild_only()
+async def check_cmd(inter: discord.Interaction, member: discord.User | None = None, search: str | None = None):
+    if not _has_check_role(inter):
+        log.info("/check refused for %s (%s): no role %s", inter.user, inter.user.id, CHECK_ROLE_ID)
+        await inter.response.send_message(f"You don't have permission to use /check (only <@&{CHECK_ROLE_ID}>).",
+                                          ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+        return
+    await inter.response.defer(ephemeral=True, thinking=True)
+    rows = await asyncio.to_thread(core.all_accounts, search or "", member.id if member else None)
+    if member:
+        title = f"MP accounts of @{member.name}"
+    elif search:
+        title = f"MP accounts matching \"{search[:40]}\""
+    else:
+        title = "All MP accounts"
+    log.info("/check by %s (%s): member=%s search=%r -> %d account(s)", inter.user, inter.user.id, member.id if member else "-", search, len(rows))
+    await inter.followup.send(embed=await check_embed(inter, rows, 0, title), view=CheckView(inter.user.id, rows, title),
+                              ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
 
 
 # 4.13.20: mod release changelog post. The text lives in wagu docs/discord/changelog.md (edit it with each
