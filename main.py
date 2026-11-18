@@ -5,6 +5,8 @@
   /help      - 4.13.15: tutorial, how to install and use MP (replaces /chardc; the character look is /stats > Switch view)
   /create     - 5.00.05: make a game account right here: /create user: pass: gender: age: (only you see it);
                 saved to your Discord like a game sign up (max 3 per Discord)
+  auto reply  - 5.00.05: "how do I make an account?" in any channel -> a public answer (14 variants) pointing to
+                the create channel (CREATE_CHANNEL_ID, default 1563160216286003272). Needs the Message Content intent
   /delete     - 5.00.05: delete one of your game accounts (form, type DELETE), then /create a new one
   /forgotuser - 3.56: shows the game username(s) of your Discord + the phones logged in to them (5.00.05),
                 and rewrites MP/accounts.txt + auth_service.txt on those phones (made again if they were deleted)
@@ -35,6 +37,7 @@ import logging
 import os
 import platform
 import re
+import sys
 import time
 import urllib.request
 
@@ -140,6 +143,12 @@ bridge = Bridge()
 
 # ------------------------------------------------------------------ Discord
 intents = discord.Intents.default()
+# 5.00.05: the "how do I make an account?" auto reply reads messages (Message Content intent: Developer Portal >
+# Bot > Privileged Gateway Intents). If it is off there, the bot notes it and starts without it next time
+# (then it still answers messages that @mention it).
+NO_CONTENT_FLAG = os.path.join(DATA_DIR, "no_message_content")
+AUTO_REPLY = os.environ.get("AUTO_REPLY", "1").strip().lower() not in ("0", "off", "no", "false")
+intents.message_content = AUTO_REPLY and not os.path.exists(NO_CONTENT_FLAG)
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
 synced = {"cmds": [], "guilds": 0, "at": 0}
@@ -441,6 +450,65 @@ async def delete_cmd(inter: discord.Interaction):
         await inter.response.send_message("This Discord has no game account. Make one with `/create`.", ephemeral=True)
         return
     await inter.response.send_modal(DeleteModal([a["user"] for a in al]))
+
+
+# ------------------------------------------------------------------ 5.00.05: "how do I make an account?" auto reply
+CREATE_CHANNEL = os.environ.get("CREATE_CHANNEL_ID", "1563160216286003272").strip()
+_CH = f"<#{CREATE_CHANNEL}>"
+CREATE_REPLIES = [
+    f"To create a new account, go to {_CH}.",
+    f"Want an MP account? Head over to {_CH} and type `/gen CODE` with the code the game shows you.",
+    f"New account? Go to {_CH} - everything you need is there.",
+    f"You can make your MP Multiplayer account in {_CH}. Type `/create user: pass: gender: age:` there.",
+    f"Account creation happens in {_CH}. Join a server in the game, copy the code and type `/gen CODE` there.",
+    f"Hey, accounts are made in {_CH}. Use `/create` or `/gen` there and you're ready to play.",
+    f"Go to {_CH} to create your account. It takes less than a minute.",
+    f"To sign up, open {_CH} and follow the steps. Need more help? Type `/help`.",
+    f"Need a new account? {_CH} is the place. You can have up to 3 accounts per Discord.",
+    f"Creating an account: go to {_CH}, type `/create user: pass: gender: age:`, then log in once in the game.",
+    f"All account stuff is in {_CH}: `/create` for a new account, `/forgotuser` and `/forgotpass` if you forgot yours.",
+    f"Make your account in {_CH}. Already have 3? Use `/delete` there first, then `/create` a new one.",
+    f"Head to {_CH} to create a new account. After that the game keeps you logged in.",
+    f"The bot makes your account in {_CH}. Type `/gen CODE` (code from the game) or `/create` there.",
+]
+_ASK = re.compile(r"\b(how|paano|pano|panu|unsaon|unsay|unsa|asa|saan|where|can\s*i|pwede|help|pls|please|tulong|what|wat)\b", re.I)
+_MAKE = re.compile(r"\b(create|creating|make|making|register|registration|sign\s*-?\s*up|gawa|gumawa|maggawa|himo|maghimo|buhat|mag\s*create|open|new|bago)\b", re.I)
+_ACC = re.compile(r"\b(acc|accs|account|accounts|acct|akawnt|akaun|user\s*name|username)\b", re.I)
+_last_reply = {"ch": {}, "user": {}, "i": -1}
+
+
+def _is_create_question(text):
+    t = (text or "").strip()
+    if not (6 <= len(t) <= 300):
+        return False
+    m, a = _MAKE.search(t), _ACC.search(t)
+    if not (m and a):
+        return False
+    return bool(_ASK.search(t)) or t.endswith("?")
+
+
+@client.event
+async def on_message(msg: discord.Message):
+    if msg.author.bot or not msg.guild or not AUTO_REPLY:
+        return
+    if str(msg.channel.id) == CREATE_CHANNEL:
+        return
+    if not _is_create_question(msg.content):
+        return
+    now = time.time()
+    if now - _last_reply["ch"].get(msg.channel.id, 0) < 60 or now - _last_reply["user"].get(msg.author.id, 0) < 300:
+        return
+    _last_reply["ch"][msg.channel.id] = _last_reply["user"][msg.author.id] = now
+    import random
+    i = random.randrange(len(CREATE_REPLIES))
+    if i == _last_reply["i"]:
+        i = (i + 1) % len(CREATE_REPLIES)
+    _last_reply["i"] = i
+    try:
+        await msg.reply(CREATE_REPLIES[i], mention_author=False)
+        log.info("auto reply (create account) to %s in #%s", msg.author, getattr(msg.channel, "name", msg.channel.id))
+    except discord.HTTPException as e:
+        log.warning("auto reply: %s", e)
 
 
 # 5.00.05: /create user: pass: gender: age: - a game account made right in Discord (your Discord is the proof, like /gen).
@@ -923,6 +991,20 @@ if __name__ == "__main__":
         log.error("Improper token: %s", why)
         time.sleep(3)
     except discord.PrivilegedIntentsRequired:
+        if intents.message_content:
+            # 5.00.05: Message Content is off in the Developer Portal: start again without it (auto reply then only
+            # for messages that @mention the bot). Delete DATA_DIR/no_message_content after turning it on.
+            try:
+                with open(NO_CONTENT_FLAG, "w") as f:
+                    f.write("Message Content intent is off in the Developer Portal\n")
+            except OSError:
+                pass
+            log.error("Message Content intent is off (Developer Portal > Bot > Privileged Gateway Intents): "
+                      "restarting without it - the 'how to create an account' auto reply needs it")
+            bridge.stop("restart without Message Content")
+            if gh:
+                gh.save(DB_PATH, "restart")
+            os.execv(sys.executable, [sys.executable] + sys.argv)
         why = "privileged intent off - Developer Portal > Bot > Privileged Gateway Intents"
         log.error(why)
     finally:

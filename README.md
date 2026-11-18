@@ -72,6 +72,7 @@ Never put them in the code:
 | `STREAM_URL` | optional (4.12.2); YouTube / Twitch link for the 24/7 **Streaming** status, `off` = no status. `STATUS_TEXTS` (titles split by `|`) and `STATUS_SECONDS` (default 30) |
 | `DATA_DIR` | optional; MP Railway sets `/var/lib/mp-railway/discordpy-bot`, Docker uses `/data` (volume) |
 | `DATA_REPO_TOKEN` | optional (5.00.05): GitHub token with contents write on `DATA_REPO` (default this repo). The bot restores `accounts.db` from the encrypted copy on branch `mp-railway-data` before it starts and saves it there after every account change, so a redeploy / new container never resets the accounts. MP Railway Cloud does this itself (no token needed) |
+| `CREATE_CHANNEL_ID` | optional (5.00.05), default `1563160216286003272`: when somebody asks "how do I create an account?" in any channel, the bot answers in public (one of 14 messages) pointing to this channel. Turn **Message Content Intent** on (Developer Portal > Bot > Privileged Gateway Intents); `AUTO_REPLY=0` turns it off |
 | `GLOBAL_SYNC` | optional, `1` = also register the commands globally (they then show twice in servers the bot is in) |
 
 Discord: invite the bot with the `bot` and `applications.commands` scopes, create a text channel
