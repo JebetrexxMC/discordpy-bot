@@ -41,7 +41,12 @@ def count_accounts(path):
     try:
         c = sqlite3.connect(path, timeout=10)
         try:
-            return c.execute("SELECT COUNT(*) FROM accounts").fetchone()[0]
+            n = c.execute("SELECT COUNT(*) FROM accounts").fetchone()[0]
+            try:   # 5.00.05: + accounts removed with Discord /delete (on purpose, not lost)
+                n += c.execute("SELECT COUNT(*) FROM deleted").fetchone()[0]
+            except sqlite3.Error:
+                pass
+            return n
         finally:
             c.close()
     except Exception:

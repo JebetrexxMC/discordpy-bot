@@ -3,7 +3,9 @@
   /gen CODE  - only in #verification: links the code shown in the game to your Discord account
   /stats     - your game account card (only you see it)   (4.13.15: back to /stats, was /statsdc)
   /help      - 4.13.15: tutorial, how to install and use MP (replaces /chardc; the character look is /stats > Switch view)
-  /create     - 5.00.05: make a game account right here: /create user: pass: gender: age: (only you see it)
+  /create     - 5.00.05: make a game account right here: /create user: pass: gender: age: (only you see it);
+                saved to your Discord like a game sign up (max 3 per Discord)
+  /delete     - 5.00.05: delete one of your game accounts (form, type DELETE), then /create a new one
   /forgotuser - 3.56: shows the game username(s) of your Discord + the phones logged in to them (5.00.05),
                 and rewrites MP/accounts.txt + auth_service.txt on those phones (made again if they were deleted)
   /forgotpass - 5.00.05: a form to set a new game password; your phones stay logged in with it
@@ -267,6 +269,7 @@ HELP_PAGES = [
      f"`/gen CODE` - link the game's code to your Discord (in #{VERIFY_CHANNEL})\n"
      "`/stats` - your account card (Refresh / Switch view = character look)\n"
      "`/create user: pass: gender: age:` - make a game account here\n"
+     "`/delete` - delete one of your game accounts (then `/create` a new one)\n"
      "`/forgotuser` - your game username(s) + your phones (writes MP/accounts.txt again)\n"
      "`/forgotpass` - set a new game password (your phones stay logged in)\n"
      "`/help` - this tutorial\n"
@@ -400,6 +403,44 @@ async def forgotpass_cmd(inter: discord.Interaction):
 @tree.command(name="resetpass", description="Set a new MP Multiplayer password (same as /forgotpass)")
 async def resetpass_cmd(inter: discord.Interaction):
     await _open_forgotpass(inter)
+
+
+# 5.00.05: /delete - removes one of your game accounts (your Discord is the proof, like /forgotpass), so /create can
+# make a new one on the same Discord. Its saved logins + phones go too; the username is free again.
+class DeleteModal(discord.ui.Modal, title="MP Multiplayer - delete account"):
+    def __init__(self, names):
+        super().__init__()
+        self.user = discord.ui.TextInput(label="Username to delete", max_length=20,
+                                         default=names[0] if len(names) == 1 else None,
+                                         placeholder=", ".join(names)[:100])
+        self.confirm = discord.ui.TextInput(label="Type DELETE to confirm (can't be undone)", max_length=6)
+        self.add_item(self.user)
+        self.add_item(self.confirm)
+
+    async def on_submit(self, inter: discord.Interaction):
+        if self.confirm.value.strip().upper() != "DELETE":
+            await inter.response.send_message("Not deleted (you did not type DELETE).", ephemeral=True)
+            return
+        ok, msg, pushes = await asyncio.to_thread(core.delete_by_discord, inter.user.id, self.user.value)
+        if not ok:
+            await inter.response.send_message(msg, ephemeral=True)
+            return
+        _push_all(pushes)
+        left = await asyncio.to_thread(core.accounts_by_discord, inter.user.id)
+        log.info("/delete by %s (%s): account %s deleted, %d left", inter.user, inter.user.id, msg, len(left))
+        await inter.response.send_message(
+            f"Account **{msg}** was deleted ({len(left)}/{MAX_ACCOUNTS} left on this Discord). "
+            f"Make a new one with `/create user: pass: gender: age:` - it is saved to your Discord the same way.",
+            ephemeral=True)
+
+
+@tree.command(name="delete", description="Delete one of your MP Multiplayer game accounts (then /create a new one)")
+async def delete_cmd(inter: discord.Interaction):
+    al = await asyncio.to_thread(core.accounts_by_discord, inter.user.id)
+    if not al:
+        await inter.response.send_message("This Discord has no game account. Make one with `/create`.", ephemeral=True)
+        return
+    await inter.response.send_modal(DeleteModal([a["user"] for a in al]))
 
 
 # 5.00.05: /create user: pass: gender: age: - a game account made right in Discord (your Discord is the proof, like /gen).
@@ -856,7 +897,7 @@ async def beacon():
             doc = {
                 "app": APP, "online": client.is_ready(), "ver": VERSION, "commit": COMMIT, "host": HOST_LABEL,
                 "bot": str(client.user) if client.user else "", "guilds": len(client.guilds),
-                "cmds": synced["cmds"] or ["/gen", "/create", "/stats", "/help", "/forgotuser", "/forgotpass", "/resetpass", "/streaming"], "login": core.ready,
+                "cmds": synced["cmds"] or ["/gen", "/create", "/delete", "/stats", "/help", "/forgotuser", "/forgotpass", "/resetpass", "/streaming"], "login": core.ready,
                 "accounts": await asyncio.to_thread(core.account_count), "brokers": bridge.connected(),
                 "ping": round(client.latency * 1000) if client.latency == client.latency else -1,
                 "started": STARTED, "ts": int(time.time()), "py": platform.python_version(), "stream": STREAM_URL,

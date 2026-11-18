@@ -99,6 +99,10 @@ class AuthCore:
         self.db.execute("""CREATE TABLE IF NOT EXISTS reissue(
             dev TEXT NOT NULL, user_lc TEXT NOT NULL, tok TEXT NOT NULL, created INTEGER NOT NULL, expires INTEGER NOT NULL,
             PRIMARY KEY(dev, user_lc))""")
+        # 5.00.05: Discord /delete. One line per deleted account (no password, no phone): GitHub saving counts
+        # accounts + deleted, so a smaller database after a /delete is not taken for a lost one.
+        self.db.execute("""CREATE TABLE IF NOT EXISTS deleted(
+            user_lc TEXT NOT NULL, discord_id TEXT NOT NULL, at INTEGER NOT NULL)""")
         self.db.commit()
         self.changed = 0        # 5.00.05: time of the last account change (main.py saves the database to GitHub)
         self.sessions = {}      # sid -> {key, broker, seen, code, vtoken, vdiscord, vname, vexp}
@@ -308,7 +312,7 @@ class AuthCore:
                 return False, "Age: 10-99", []
             al = self._accounts_of(discord_id)
             if len(al) >= MAX_ACCOUNTS:
-                return False, "This Discord already has %d game accounts (the limit): %s." % (len(al), ", ".join(x["user"] for x in al)), []
+                return False, "This Discord already has %d game accounts (the limit): %s. Remove one with /delete first." % (len(al), ", ".join(x["user"] for x in al)), []
             if self._account("user_lc", user.lower()):
                 return False, "That username is taken", []
             salt, t = secrets.token_hex(16), _now()
@@ -324,6 +328,37 @@ class AuthCore:
             self.db.commit()
             self.changed = _now()
             return True, (user, phones), self._pushes_for(discord_id)
+
+    # ---------------------------------------------------------------- 5.00.05: Discord /delete
+    def delete_by_discord(self, discord_id, user):
+        """/delete: removes one game account of this Discord (its saved logins + phones too), so /create can make
+        a new one (MAX_ACCOUNTS per Discord). -> (ok, message or user name, pushes for its online phones)."""
+        with self.lock:
+            if not self._rate(self.fails, "ddelete:" + str(discord_id), 5, 3600):
+                return False, "Too many /delete. Wait an hour.", []
+            al = self._accounts_of(discord_id)
+            if not al:
+                return False, "This Discord has no game account.", []
+            a = next((x for x in al if x["user"].lower() == (user or "").strip().lower()), None)
+            if not a:
+                return False, "That is not one of your accounts. Yours: %s." % ", ".join(x["user"] for x in al), []
+            ulc = a["user"].lower()
+            keys = {r[0] for r in self.db.execute("SELECT dev FROM devices WHERE discord_id=?", (str(discord_id),)).fetchall()}
+            for t in ("remember", "devices", "reissue"):
+                self.db.execute(f"DELETE FROM {t} WHERE user_lc=?", (ulc,))
+            self.db.execute("DELETE FROM accounts WHERE user_lc=?", (ulc,))
+            self.db.execute("INSERT INTO deleted(user_lc,discord_id,at) VALUES(?,?,?)", (ulc, str(discord_id), _now()))
+            self.db.commit()
+            self.changed = _now()
+            for k in [k for k, (u, _) in self.logins.items() if u == ulc]:
+                del self.logins[k]
+            out = []   # its phones that are online: their files lose the saved login of it
+            for sid, s in list(self.sessions.items()):
+                if s.get("dev") and self._dev_key(s["dev"]) in keys and s.get("seen", 0) > _now() - 3600:
+                    ans = self._sync_answer(s)
+                    ans["rid"] = "y"
+                    out.append((sid, self.seal(s, ans)))
+            return True, a["user"], out
 
     # ---------------------------------------------------------------- 5.00.05: Discord /forgotuser
     def forgot_info(self, discord_id):
