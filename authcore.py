@@ -36,6 +36,9 @@ REMEMBER_MAX = 5                 # phones per account
 MAX_ACCOUNTS = 3                 # 4.03: game accounts per Discord account (was 1)
 DEVICE_TTL = 24 * 3600      # 3.21.8: a /gen is remembered for the phone 24 h (game restart -> Create your account)
 DEV_RE = re.compile(r"^[0-9a-f]{32}$")
+REISSUE_TTL = 14 * 24 * 3600     # 5.00.05: a saved login made for a phone (Discord /create, /forgotpass) waits 14 days for it
+DEVICE_MAX = 8                   # 5.00.05: phones remembered per account (registry, newest kept)
+APPS = ("game", "game-sa", "game-vc", "moquil", "tde", "web")
 PBKDF2_ROUNDS = 200_000
 USER_RE = re.compile(r"^[A-Za-z0-9_]{3,20}$")
 GENDERS = ("Male", "Female", "Other")
@@ -84,7 +87,20 @@ class AuthCore:
             tok TEXT PRIMARY KEY, user_lc TEXT NOT NULL, dev TEXT NOT NULL, created INTEGER NOT NULL, expires INTEGER NOT NULL)""")
         self.db.execute("""CREATE TABLE IF NOT EXISTS pending(
             dev TEXT PRIMARY KEY, discord_id TEXT NOT NULL, discord_name TEXT NOT NULL, expires INTEGER NOT NULL)""")
+        # 5.00.05: phone registry. A phone (auth_device id, stored hashed) is only added after it proved the account:
+        # a password login / sign up / reset on it, or a Discord /gen from that phone followed by /create.
+        # Random or copied ids never get in, so the list is the real phones of the account.
+        self.db.execute("""CREATE TABLE IF NOT EXISTS devices(
+            dev TEXT NOT NULL, user_lc TEXT NOT NULL, discord_id TEXT NOT NULL, app TEXT NOT NULL DEFAULT '',
+            first_seen INTEGER NOT NULL, last_seen INTEGER NOT NULL, logins INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY(dev, user_lc))""")
+        # 5.00.05: saved logins waiting for a registered phone (after /create or /forgotpass in Discord).
+        # The phone picks it up with op=sync and writes it to MP/auth_service.txt.
+        self.db.execute("""CREATE TABLE IF NOT EXISTS reissue(
+            dev TEXT NOT NULL, user_lc TEXT NOT NULL, tok TEXT NOT NULL, created INTEGER NOT NULL, expires INTEGER NOT NULL,
+            PRIMARY KEY(dev, user_lc))""")
         self.db.commit()
+        self.changed = 0        # 5.00.05: time of the last account change (main.py saves the database to GitHub)
         self.sessions = {}      # sid -> {key, broker, seen, code, vtoken, vdiscord, vname, vexp}
         self.codes = {}         # code -> (sid, expires)
         self.logins = {}        # sess token -> (user_lc, expires)
@@ -233,25 +249,158 @@ class AuthCore:
         self.db.execute("UPDATE accounts SET pass_hash=?, salt=?, rounds=? WHERE user_lc=?",
                         (self._hash(pw, salt, PBKDF2_ROUNDS), salt, PBKDF2_ROUNDS, user_lc))
         self.db.execute("DELETE FROM remember WHERE user_lc=?", (user_lc,))
+        self.db.execute("DELETE FROM reissue WHERE user_lc=?", (user_lc,))
         self.db.commit()
+        self.changed = _now()
         for k in [k for k, (u, _) in self.logins.items() if u == user_lc]:
             del self.logins[k]
 
-    def reset_by_discord(self, discord_id, pw, user=""):
-        """Discord /resetpass: (ok, message). 4.03: user = which of the (max 3) accounts."""
+    def reset_by_discord(self, discord_id, pw, user="", keep_phones=True):
+        """Discord /forgotpass (/resetpass): (ok, message, pushes). 4.03: user = which of the (max 3) accounts.
+        5.00.05: keep_phones = the phones that were logged in to it get a new saved login (auth_service.txt),
+        so they stay logged in with the new password; False = every phone is logged out."""
         with self.lock:
             if not (6 <= len(pw) <= 32):
-                return False, "Password: 6-32 characters."
+                return False, "Password: 6-32 characters.", []
             if not self._rate(self.fails, "dreset:" + str(discord_id), 5, 3600):
-                return False, "Too many resets. Wait an hour."
+                return False, "Too many resets. Wait an hour.", []
             al = self._accounts_of(discord_id)
             if not al:
-                return False, "This Discord has no game account yet. Create one in the game (Login screen > New account)."
+                return False, "This Discord has no game account yet. Make one with /create (or in the game: Login screen > New account).", []
             a = next((x for x in al if x["user"].lower() == (user or "").strip().lower()), None) if user else (al[0] if len(al) == 1 else None)
             if not a:
-                return False, "This Discord has %d game accounts (%s): type the username of the one to reset." % (len(al), ", ".join(x["user"] for x in al))
-            self._set_password(a["user"].lower(), pw)
-            return True, a["user"]
+                return False, "This Discord has %d game accounts (%s): type the username of the one to reset." % (len(al), ", ".join(x["user"] for x in al)), []
+            ulc = a["user"].lower()
+            devs = [r[0] for r in self.db.execute("SELECT dev FROM devices WHERE user_lc=?", (ulc,)).fetchall()]
+            self._set_password(ulc, pw)
+            n = 0
+            if keep_phones:
+                for dk in devs:
+                    self._queue_login(dk, ulc)
+                    n += 1
+            else:
+                self.db.execute("DELETE FROM devices WHERE user_lc=?", (ulc,))
+            self.db.commit()
+            return True, (a["user"], n), self._pushes_for(discord_id)
+
+    # ---------------------------------------------------------------- 5.00.05: Discord /create
+    def create_by_discord(self, discord_id, discord_name, user, pw, gender, age):
+        """/create user: pass: gender: age: -> (ok, message, pushes). The Discord account is the proof (like /gen).
+        A phone that did /gen for this Discord in the last 24 h is logged in to the new account by itself."""
+        with self.lock:
+            if not self.ready:
+                return False, "The login system is not set up yet (no AUTH_PRIVATE_KEY).", []
+            if not self._rate(self.fails, "dcreate:" + str(discord_id), 5, 3600):
+                return False, "Too many /create. Wait an hour.", []
+            user, gender = (user or "").strip(), str(gender or "").strip()
+            if not USER_RE.match(user):
+                return False, "Username: 3-20 letters, numbers or _", []
+            if not (6 <= len(pw or "") <= 32):
+                return False, "Password: 6-32 characters", []
+            gender = next((g for g in GENDERS if g.lower() == gender.lower()), "")
+            if not gender:
+                return False, "Pick a gender: Male, Female or Other", []
+            try:
+                age = int(age)
+            except (TypeError, ValueError):
+                age = 0
+            if not (10 <= age <= 99):
+                return False, "Age: 10-99", []
+            al = self._accounts_of(discord_id)
+            if len(al) >= MAX_ACCOUNTS:
+                return False, "This Discord already has %d game accounts (the limit): %s." % (len(al), ", ".join(x["user"] for x in al)), []
+            if self._account("user_lc", user.lower()):
+                return False, "That username is taken", []
+            salt, t = secrets.token_hex(16), _now()
+            self.db.execute("INSERT INTO accounts(user,user_lc,discord_id,discord_name,pass_hash,salt,rounds,gender,age,created) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                            (user, user.lower(), str(discord_id), _clean(discord_name, 40), self._hash(pw, salt, PBKDF2_ROUNDS), salt, PBKDF2_ROUNDS, gender, age, t))
+            # phones that did /gen for this Discord (pending, 24 h): registered + a saved login waiting for them
+            phones = 0
+            for (dk,) in self.db.execute("SELECT dev FROM pending WHERE discord_id=? AND expires>=?", (str(discord_id), t)).fetchall():
+                self._register_dev_key(dk, user.lower(), str(discord_id), "game")
+                self._queue_login(dk, user.lower())
+                phones += 1
+            self.db.execute("DELETE FROM pending WHERE discord_id=?", (str(discord_id),))
+            self.db.commit()
+            self.changed = _now()
+            return True, (user, phones), self._pushes_for(discord_id)
+
+    # ---------------------------------------------------------------- 5.00.05: Discord /forgotuser
+    def forgot_info(self, discord_id):
+        """[(account dict, [phone dicts])] of this Discord + pushes that rewrite accounts.txt on its online phones."""
+        with self.lock:
+            out = []
+            for a in self._accounts_of(discord_id):
+                rows = self.db.execute("SELECT dev,app,first_seen,last_seen,logins FROM devices WHERE user_lc=? ORDER BY last_seen DESC",
+                                       (a["user"].lower(),)).fetchall()
+                out.append((a, [{"id": r[0][:6], "app": r[1] or "game", "first": r[2], "last": r[3], "logins": r[4]} for r in rows]))
+            return out, self._pushes_for(discord_id)
+
+    # ---------------------------------------------------------------- 5.00.05: phone registry + saved login sync
+    def _register_dev_key(self, dk, user_lc, discord_id, app=""):
+        t = _now()
+        app = app if app in APPS else ""
+        self.db.execute("""INSERT INTO devices(dev,user_lc,discord_id,app,first_seen,last_seen,logins) VALUES(?,?,?,?,?,?,1)
+                           ON CONFLICT(dev,user_lc) DO UPDATE SET last_seen=excluded.last_seen, logins=logins+1,
+                           app=CASE WHEN excluded.app<>'' THEN excluded.app ELSE app END, discord_id=excluded.discord_id""",
+                        (dk, user_lc, str(discord_id), app, t, t))
+        old = self.db.execute("SELECT dev FROM devices WHERE user_lc=? ORDER BY last_seen DESC LIMIT -1 OFFSET ?", (user_lc, DEVICE_MAX)).fetchall()
+        for (k,) in old:
+            self.db.execute("DELETE FROM devices WHERE dev=? AND user_lc=?", (k, user_lc))
+
+    def _register_dev(self, a, s, app=""):
+        if s and s.get("dev"):
+            self._register_dev_key(self._dev_key(s["dev"]), a["user"].lower(), a["discord_id"], app)
+
+    def _queue_login(self, dk, user_lc):
+        self.db.execute("INSERT OR REPLACE INTO reissue(dev,user_lc,tok,created,expires) VALUES(?,?,?,?,?)",
+                        (dk, user_lc, secrets.token_hex(16), _now(), _now() + REISSUE_TTL))
+
+    def _sync_answer(self, s, sess=""):
+        """op=sync: what this phone's MP/auth_service.txt + accounts.txt should say. Only registered phones get
+        anything; a saved login waiting for it (reissue) becomes a real one (remember) and is sent again on every
+        sync until the phone shows it back (so a missed push loses nothing)."""
+        if not s.get("dev"):
+            return {"op": "sync", "ok": 0, "err": "no device id"}
+        dk, t = self._dev_key(s["dev"]), _now()
+        self.db.execute("DELETE FROM reissue WHERE expires<?", (t,))
+        user_lc, tok = None, ""
+        u = self._remembered(sess, s) if sess else None
+        if u:                                            # the saved login of the phone still works
+            user_lc, tok = u, sess
+            self.db.execute("DELETE FROM reissue WHERE dev=? AND tok=?", (dk, sess))   # the new one arrived
+        else:
+            # a saved login waiting for it (after /forgotpass or /create): sent until the phone uses it (14 days)
+            row = self.db.execute("SELECT user_lc,tok FROM reissue WHERE dev=? ORDER BY created DESC LIMIT 1", (dk,)).fetchone()
+            if row and self._account("user_lc", row[0]):
+                user_lc, tok = row
+                self.db.execute("DELETE FROM remember WHERE user_lc=? AND dev=?", (user_lc, dk))
+                self.db.execute("INSERT INTO remember(tok,user_lc,dev,created,expires) VALUES(?,?,?,?,?)",
+                                (self._tok_key(tok), user_lc, dk, t, t + REMEMBER_TTL))
+        self.db.commit()
+        if user_lc:
+            a = self._account("user_lc", user_lc)
+            self.db.execute("UPDATE devices SET last_seen=? WHERE dev=? AND user_lc=?", (t, dk, user_lc))
+            self.db.commit()
+            users = [x["user"] for x in self._accounts_of(a["discord_id"])]
+            return {"op": "sync", "ok": 1, "user": a["user"], "sess": tok, "users": ",".join(users),
+                    "discord": a["discord_name"], "gender": a["gender"], "age": a["age"]}
+        rows = self.db.execute("SELECT user_lc FROM devices WHERE dev=? ORDER BY last_seen DESC", (dk,)).fetchall()
+        users = [a["user"] for a in (self._account("user_lc", r[0]) for r in rows) if a]
+        if users:   # known phone, logged out: just the names (no login)
+            return {"op": "sync", "ok": 1, "user": "", "sess": "", "users": ",".join(users[:MAX_ACCOUNTS])}
+        return {"op": "sync", "ok": 0, "err": "not registered"}
+
+    def _pushes_for(self, discord_id):
+        """op=sync pushes for every phone of this Discord that is online right now (game / Moquil / Textdraw Editor)."""
+        keys = {r[0] for r in self.db.execute("SELECT dev FROM devices WHERE discord_id=?", (str(discord_id),)).fetchall()}
+        out = []
+        for sid, s in list(self.sessions.items()):
+            if s.get("dev") and self._dev_key(s["dev"]) in keys and s.get("seen", 0) > _now() - 3600:
+                ans = self._sync_answer(s)
+                ans["rid"] = "y"
+                out.append((sid, self.seal(s, ans)))
+        return out
 
     def _hash(self, password, salt, rounds):
         return hashlib.pbkdf2_hmac("sha256", password.encode(), bytes.fromhex(salt), rounds).hex()
@@ -287,10 +436,12 @@ class AuthCore:
         self.db.commit()
         return row[0]
 
-    def _logged_in(self, a, chal, server, sid, s=None):
+    def _logged_in(self, a, chal, server, sid, s=None, app=""):
         self.db.execute("UPDATE accounts SET last_login=?, logins=logins+1, last_server=? WHERE user_lc=?",
                         (_now(), _clean(server, 39), a["user"].lower()))
+        self._register_dev(a, s, app)                    # 5.00.05: this phone proved the account (registry)
         self.db.commit()
+        self.changed = _now()
         sess = self._remember(a["user"].lower(), s)
         if not sess:                                     # old phone (no device id): 12 h in memory, like before
             sess = secrets.token_hex(16)
@@ -382,6 +533,24 @@ class AuthCore:
         dev = q.get("dev", "")
         if DEV_RE.match(dev):
             s["dev"] = dev
+        app = q.get("app", "")
+        if op == "sync":                                 # 5.00.05: auth_service.txt / accounts.txt of this phone
+            if not self._rate(self.fails, "sync:" + sid, 30, 600):
+                return {"ok": 0, "err": "Too many requests. Wait a few minutes."}
+            return self._sync_answer(s, q.get("sess", ""))
+        if op == "logout":                               # 5.00.05: Logout on the phone = its saved login ends here too
+            tok = q.get("sess", "")
+            if s.get("dev"):
+                dk = self._dev_key(s["dev"])
+                u = self._remembered(tok, s) if re.fullmatch(r"[0-9a-f]{32}", tok or "") else None
+                if u:
+                    self.db.execute("DELETE FROM remember WHERE tok=?", (self._tok_key(tok),))
+                    self.db.execute("DELETE FROM devices WHERE dev=? AND user_lc=?", (dk, u))
+                    self.db.execute("DELETE FROM reissue WHERE dev=? AND user_lc=?", (dk, u))
+                    self.db.commit()
+                    self.changed = _now()
+            self.logins.pop(tok, None)
+            return {"ok": 1}
         if op not in ("hello", "gen", "stats", "avatar"):
             s["vpush"] = None                            # the phone moved on (sign up / login): stop re-sending
         if op in ("hello", "gen"):
@@ -432,7 +601,7 @@ class AuthCore:
             s["vtoken"] = None
             self._forget_dev(s, s["vdiscord"])
             a = self._account("user_lc", user.lower())
-            return self._logged_in(a, q.get("chal", ""), q.get("srv", ""), sid, s)
+            return self._logged_in(a, q.get("chal", ""), q.get("srv", ""), sid, s, app)
         if op == "reset":                                # 3.56: forgot password (after a fresh /gen)
             if not s.get("vtoken") or not hmac.compare_digest(s["vtoken"], q.get("vtoken", "")) or s.get("vexp", 0) < _now():
                 return {"ok": 0, "again": 1, "err": "Verification expired. Do /gen with the new code."}
@@ -451,7 +620,7 @@ class AuthCore:
             self._set_password(a["user"].lower(), pw)
             s["vtoken"] = None
             self._forget_dev(s, s["vdiscord"])
-            return self._logged_in(a, q.get("chal", ""), q.get("srv", ""), sid, s)
+            return self._logged_in(a, q.get("chal", ""), q.get("srv", ""), sid, s, app)
         if op == "login":
             user, pw = q.get("user", ""), q.get("pass", "")
             if not self._rate(self.fails, "login:" + sid, 10, 600) or not self._rate(self.fails, "user:" + user.lower(), 8, 600):
@@ -459,7 +628,7 @@ class AuthCore:
             a = self._account("user_lc", user.lower())
             if not a or not hmac.compare_digest(a["pass_hash"], self._hash(pw, a["salt"], a["rounds"])):
                 return {"ok": 0, "err": "Wrong username or password"}
-            return self._logged_in(a, q.get("chal", ""), q.get("srv", ""), sid, s)
+            return self._logged_in(a, q.get("chal", ""), q.get("srv", ""), sid, s, app)
         if op in ("ticket", "stats", "avatar"):
             v = self.logins.get(q.get("sess", ""))
             if not v or v[1] < _now():
@@ -468,6 +637,8 @@ class AuthCore:
                 if v and op == "ticket":   # checked against the phone id every time (not cached)
                     self.db.execute("UPDATE accounts SET last_login=?, logins=logins+1, last_server=? WHERE user_lc=?",
                                                     (_now(), _clean(q.get("srv", ""), 39), u))
+                    self.db.execute("UPDATE devices SET last_seen=?, logins=logins+1 WHERE dev=? AND user_lc=?",
+                                    (_now(), self._dev_key(s["dev"]), u))
                     self.db.commit()
             if not v or v[1] < _now():
                 return {"ok": 0, "err": "Session expired. Log in again.", "relogin": 1}

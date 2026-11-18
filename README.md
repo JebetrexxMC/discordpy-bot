@@ -18,6 +18,8 @@ server with "Authentication system" on.
 4. `/stats` (Discord, only visible to you, card with Refresh / Switch view buttons - Switch view = the character look; was `/stats` before 4.13.15) or `/stats` / `/char` in the game: your account.
    `/help` (4.13.15, replaces `/chardc`): the tutorial - install, account, playing, commands, problems (pages, only visible to you).
 5. Forgot your account (3.56): `/forgotuser` shows your game username, `/resetpass` opens a form for a new password (all phones get logged out). In the game: Login screen > Forgot username? / Forgot password?, then `/gen CODE` in #verification.
+   5.00.05: `/forgotpass` (form: new password; your phones stay logged in, they get a new saved login in `MP/auth_service.txt`), `/resetpass` = the same. `/forgotuser` now also lists the phones logged in to each account and writes `MP/accounts.txt` + `MP/auth_service.txt` again on them (made new when they were deleted; offline phones on the next game / Moquil / Textdraw Editor start). Only phones that really logged in (or showed a `/gen` code) are registered, by their `auth_device` id.
+   `/create user: pass: gender: age:` (5.00.05): make the game account right in Discord. A phone that showed a `/gen` code in the last 24 h is logged in to it by itself; otherwise Login once in the game.
 6. 24/7 stream (4.13.16): `/streaming on` (server managers, while you are in a voice channel, or pick `channel:`) - the bot joins and plays the MP YouTube live (https://www.youtube.com/live/rFZHOHl-L8A) there 24/7, also after restarts. `/streaming status`, `/streaming off`. Discord blocks video / Go Live for bot accounts, so the bot plays the sound and posts a **Watch video (in voice)** button in the voice channel's chat: it opens Discord's Watch Together activity right in the voice channel, everybody who taps it watches the live together (`/streaming watch` posts the button again). Re-invite the bot with the log's invite link so it has Create Invite. The server needs ffmpeg (MP Railway installs it). If YouTube asks the server to sign in, put a cookies.txt at `DATA_DIR/yt_cookies.txt` (or set `YT_COOKIES`). Re-invite the bot with the new link from the log if it lacks Connect / Speak.
 
 Accounts are stored only here (SQLite, password hashed with PBKDF2-SHA256 + salt). The game and the
@@ -68,6 +70,7 @@ Never put them in the code:
 | `VERIFY_CHANNEL` | optional, default `verification` |
 | `STREAM_URL` | optional (4.12.2); YouTube / Twitch link for the 24/7 **Streaming** status, `off` = no status. `STATUS_TEXTS` (titles split by `|`) and `STATUS_SECONDS` (default 30) |
 | `DATA_DIR` | optional; MP Railway sets `/var/lib/mp-railway/discordpy-bot`, Docker uses `/data` (volume) |
+| `DATA_REPO_TOKEN` | optional (5.00.05): GitHub token with contents write on `DATA_REPO` (default this repo). The bot restores `accounts.db` from the encrypted copy on branch `mp-railway-data` before it starts and saves it there after every account change, so a redeploy / new container never resets the accounts. MP Railway Cloud does this itself (no token needed) |
 | `GLOBAL_SYNC` | optional, `1` = also register the commands globally (they then show twice in servers the bot is in) |
 
 Discord: invite the bot with the `bot` and `applications.commands` scopes, create a text channel

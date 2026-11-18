@@ -3,8 +3,11 @@
   /gen CODE  - only in #verification: links the code shown in the game to your Discord account
   /stats     - your game account card (only you see it)   (4.13.15: back to /stats, was /statsdc)
   /help      - 4.13.15: tutorial, how to install and use MP (replaces /chardc; the character look is /stats > Switch view)
-  /forgotuser - 3.56: shows the game username of your Discord (only you see it)
-  /resetpass  - 3.56: a form to set a new game password (logs out your phones)
+  /create     - 5.00.05: make a game account right here: /create user: pass: gender: age: (only you see it)
+  /forgotuser - 3.56: shows the game username(s) of your Discord + the phones logged in to them (5.00.05),
+                and rewrites MP/accounts.txt + auth_service.txt on those phones (made again if they were deleted)
+  /forgotpass - 5.00.05: a form to set a new game password; your phones stay logged in with it
+                (a new saved login goes to their MP/auth_service.txt). /resetpass = the same form
   /streaming on|off - 4.13.16: (server managers) the bot joins a voice channel and plays the YouTube live 24/7
   /changelog  - 4.13.20: (server managers) posts the mod release changelog (wagu docs/discord/changelog.md) with @everyone
 
@@ -12,6 +15,8 @@ Settings are environment variables, never put them in the code or in git:
   DISCORD_TOKEN     the bot token (Discord Developer Portal -> Bot -> Reset Token)
   AUTH_PRIVATE_KEY  the login system key (64 hex characters, matches the public key in the mod)
   DATA_DIR          optional, default /data (Docker) or ./data; accounts.db lives here
+  DATA_REPO_TOKEN   5.00.05 optional: GitHub token (contents:write) - accounts.db is restored from / saved to GitHub
+                    (encrypted, branch mp-railway-data of DATA_REPO), so a redeploy never resets the accounts
   VERIFY_CHANNEL    optional, default "verification"
   MP_RAILWAY_APP    set by MP Railway: app name (status beacon topic)
   MP_RAILWAY_COMMIT set by MP Railway: deployed git commit
@@ -35,9 +40,10 @@ import discord
 from discord import app_commands
 import paho.mqtt.client as mqtt
 
-from authcore import AuthCore, TOPIC_REQ, TOPIC_RES
+from authcore import AuthCore, TOPIC_REQ, TOPIC_RES, MAX_ACCOUNTS
+from ghstore import GhStore
 
-VERSION = "4.13.21"
+VERSION = "5.00.05"
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("mpbot")
 
@@ -50,7 +56,13 @@ HOST_LABEL = os.environ.get("MP_RAILWAY_HOST", "MP Railway")
 STATUS_TOPIC = f"wagu/railway/{APP}/status"     # retained; the website's Railway page reads it
 STARTED = int(time.time())
 
-core = AuthCore(os.environ.get("AUTH_PRIVATE_KEY", ""), os.path.join(DATA_DIR, "accounts.db"))
+DB_PATH = os.path.join(DATA_DIR, "accounts.db")
+# 5.00.05: GitHub keeps the accounts (encrypted). Restored BEFORE the database is opened, so a redeploy, a new
+# Railway container or a lost volume never starts with an empty account list.
+gh = GhStore.from_env(os.environ.get("AUTH_PRIVATE_KEY", ""))
+if gh:
+    log.info("GitHub data: %s", gh.restore(DB_PATH))
+core = AuthCore(os.environ.get("AUTH_PRIVATE_KEY", ""), DB_PATH)
 if not core.ready:
     log.warning("AUTH_PRIVATE_KEY is not set: /gen and game logins are off until you add it (sudo mp-railway env set AUTH_PRIVATE_KEY)")
 else:
@@ -242,7 +254,8 @@ HELP_PAGES = [
      "Servers with the login system on ask you to log in:\n"
      "1. Join the server: the game shows an **8-character code** (new every time).\n"
      f"2. Type `/gen CODE` in **#{VERIFY_CHANNEL}** (only works there, only you see the answer).\n"
-     "3. In the game: **Sign up** (user, password, gender, age) -> Create. Next time: just Login.\n"
+     "3. In the game: **Sign up** (user, password, gender, age) -> Create. Or right here: `/create user: pass: gender: age:`.\n"
+     "4. Your phone stays logged in (game restart, rejoin, Moquil, Textdraw Editor): `MP/auth_service.txt` keeps the login.\n"
      "Up to 3 accounts per Discord. The default server has the login off unless an [ADMIN] / [MOD] turns it on."),
     ("3/5 - Playing",
      "- **Default server**: tap *Connect* - everybody on the same Wi-Fi / hotspot or the internet lobby meets there.\n"
@@ -253,15 +266,17 @@ HELP_PAGES = [
     ("4/5 - Discord commands",
      f"`/gen CODE` - link the game's code to your Discord (in #{VERIFY_CHANNEL})\n"
      "`/stats` - your account card (Refresh / Switch view = character look)\n"
-     "`/forgotuser` - shows your game username(s)\n"
-     "`/resetpass` - set a new game password (logs out your phones)\n"
+     "`/create user: pass: gender: age:` - make a game account here\n"
+     "`/forgotuser` - your game username(s) + your phones (writes MP/accounts.txt again)\n"
+     "`/forgotpass` - set a new game password (your phones stay logged in)\n"
      "`/help` - this tutorial\n"
      "`/streaming on` / `off` - (server managers) 24/7 YouTube live in a voice channel: sound by the bot, video with the Watch video button\n"
      "In the game: `/stats`, `/char`, `/coop help`, `/mapedit help`."),
     ("5/5 - Problems?",
      "- **No code / can't log in**: check Wi-Fi or mobile data; the login needs the internet.\n"
      "- **Code not accepted**: it changes every join - use the newest one, in the right channel.\n"
-     "- **Forgot username / password**: `/forgotuser`, `/resetpass` (or in the game: Login screen > Forgot...).\n"
+     "- **Forgot username / password**: `/forgotuser`, `/forgotpass` (or in the game: Login screen > Forgot...).\n"
+     "- **Login asked again after a restart**: update to MP 5.00.05+; don't delete `MP/auth_service.txt`.\n"
      "- **Black loading screen / freeze on join**: update to the newest MP (4.13.15+).\n"
      "- Still stuck? Ask in the server with a screenshot."),
 ]
@@ -306,39 +321,135 @@ async def help_cmd(inter: discord.Interaction):
     await inter.response.send_message(embed=help_embed(0), view=HelpView(inter.user.id), ephemeral=True)
 
 
-@tree.command(name="forgotuser", description="Forgot your MP Multiplayer username? Shows it (only you see it)")
+def _push_all(pushes):
+    for sid, frame in pushes:
+        bridge.push(sid, frame)
+
+
+def _phones_text(phones):
+    if not phones:
+        return "no phone logged in yet"
+    parts = []
+    for p in phones[:4]:
+        parts.append(f"{p['app']} `{p['id']}` last seen {_ago(p['last'])}")
+    more = f" (+{len(phones) - 4} more)" if len(phones) > 4 else ""
+    return "; ".join(parts) + more
+
+
+# 5.00.05: /forgotuser - your usernames + the phones logged in to them. The phones that are online get their
+# MP/accounts.txt + auth_service.txt written again (the game makes them if they were deleted); the others on the
+# next game / Moquil / Textdraw Editor start.
+@tree.command(name="forgotuser", description="Forgot your MP Multiplayer username? Shows it + your phones (only you see it)")
 async def forgotuser_cmd(inter: discord.Interaction):
-    al = await asyncio.to_thread(core.accounts_by_discord, inter.user.id)
-    if not al:
-        await inter.response.send_message("This Discord has no game account yet. In the game: Login screen > New account (Discord code).", ephemeral=True)
+    info, pushes = await asyncio.to_thread(core.forgot_info, inter.user.id)
+    if not info:
+        await inter.response.send_message("This Discord has no game account yet. Make one with `/create` (or in the game: Login screen > New account).", ephemeral=True)
         return
-    names = ", ".join(f"**{a['user']}**" for a in al)
-    word = "username is" if len(al) == 1 else f"usernames ({len(al)}/3) are"
-    await inter.response.send_message(f"Your MP Multiplayer {word} {names}. Forgot the password too? Use /resetpass.", ephemeral=True)
+    _push_all(pushes)
+    log.info("/forgotuser by %s (%s): %d account(s), %d phone(s) online re-synced", inter.user, inter.user.id, len(info), len(pushes))
+    e = discord.Embed(title="Your MP Multiplayer account" + ("s" if len(info) > 1 else ""), color=0xD7263D,
+                      description=f"{len(info)}/{MAX_ACCOUNTS} game accounts on this Discord. Forgot the password too? Use `/forgotpass`.")
+    for a, phones in info:
+        e.add_field(name=a["user"], value=f"Last login {_ago(a['last_login'])}\nPhones: {_phones_text(phones)}", inline=False)
+    e.add_field(name="Files on your phone", inline=False,
+                value=("Sent to your phone now: `MP/accounts.txt` and `MP/auth_service.txt` are written again." if pushes else
+                       "Open the game (or Moquil / Textdraw Editor): `MP/accounts.txt` and `MP/auth_service.txt` are written again by themselves (made new if they were deleted)."))
+    e.set_footer(text=f"MP bot {VERSION} · only you see this")
+    await inter.response.send_message(embed=e, ephemeral=True)
 
 
-class ResetPassModal(discord.ui.Modal, title="MP Multiplayer - new password"):
+class ForgotPassModal(discord.ui.Modal, title="MP Multiplayer - new password"):
     user = discord.ui.TextInput(label="Username (needed when you have 2-3 accounts)", required=False, max_length=20)
     pw = discord.ui.TextInput(label="New password (6-32)", min_length=6, max_length=32)
     pw2 = discord.ui.TextInput(label="Confirm new password", min_length=6, max_length=32)
+    keep = discord.ui.TextInput(label="Keep my phones logged in? (yes / no)", default="yes", required=False, max_length=3)
 
     async def on_submit(self, inter: discord.Interaction):
         if self.pw.value != self.pw2.value:
-            await inter.response.send_message("The passwords do not match. Try /resetpass again.", ephemeral=True)
+            await inter.response.send_message("The passwords do not match. Try /forgotpass again.", ephemeral=True)
             return
-        ok, msg = await asyncio.to_thread(core.reset_by_discord, inter.user.id, self.pw.value, self.user.value or "")
+        keep = (self.keep.value or "yes").strip().lower() not in ("no", "n", "0")
+        ok, msg, pushes = await asyncio.to_thread(core.reset_by_discord, inter.user.id, self.pw.value, self.user.value or "", keep)
         if ok:
-            msg = f"Password changed for **{msg}**. Log in with it in the game (your phones were logged out)."
+            _push_all(pushes)
+            name, phones = msg
+            log.info("/forgotpass by %s (%s): %s, %d phone(s) keep the login, %d online now", inter.user, inter.user.id, name, phones, len(pushes))
+            if keep and phones:
+                msg = (f"Password changed for **{name}**. Your {phones} phone(s) stay logged in: a new saved login goes to "
+                       f"their `MP/auth_service.txt` ({'sent now' if pushes else 'on the next game start'}). Other phones need the new password.")
+            elif keep:
+                msg = f"Password changed for **{name}**. Log in with it in the game once; the phone then stays logged in."
+            else:
+                msg = f"Password changed for **{name}**. Every phone was logged out: log in with the new password."
         await inter.response.send_message(msg, ephemeral=True)
 
 
-@tree.command(name="resetpass", description="Forgot your MP Multiplayer password? Set a new one (only you see it)")
-async def resetpass_cmd(inter: discord.Interaction):
+async def _open_forgotpass(inter: discord.Interaction):
     a = await asyncio.to_thread(core.account_by_discord, inter.user.id)
     if not a:
-        await inter.response.send_message("This Discord has no game account yet. In the game: Login screen > New account (Discord code).", ephemeral=True)
+        await inter.response.send_message("This Discord has no game account yet. Make one with `/create` (or in the game: Login screen > New account).", ephemeral=True)
         return
-    await inter.response.send_modal(ResetPassModal())
+    await inter.response.send_modal(ForgotPassModal())
+
+
+@tree.command(name="forgotpass", description="Forgot your MP Multiplayer password? Set a new one (only you see it)")
+async def forgotpass_cmd(inter: discord.Interaction):
+    await _open_forgotpass(inter)
+
+
+@tree.command(name="resetpass", description="Set a new MP Multiplayer password (same as /forgotpass)")
+async def resetpass_cmd(inter: discord.Interaction):
+    await _open_forgotpass(inter)
+
+
+# 5.00.05: /create user: pass: gender: age: - a game account made right in Discord (your Discord is the proof, like /gen).
+# A phone that showed a /gen code for this Discord in the last 24 h is logged in to it by itself.
+@tree.command(name="create", description="Make an MP Multiplayer game account (only you see it)")
+@app_commands.describe(user="Username: 3-20 letters, numbers or _", password="Password: 6-32 characters",
+                       gender="Your character's gender", age="Age (10-99)")
+@app_commands.rename(password="pass")
+@app_commands.choices(gender=[app_commands.Choice(name="Male", value="Male"), app_commands.Choice(name="Female", value="Female"),
+                              app_commands.Choice(name="Other", value="Other")])
+async def create_cmd(inter: discord.Interaction, user: str, password: str, gender: app_commands.Choice[str],
+                     age: app_commands.Range[int, 10, 99]):
+    if not core.ready:
+        await inter.response.send_message("The login system is starting up (no key yet). Try again in a minute.", ephemeral=True)
+        return
+    await inter.response.defer(ephemeral=True)
+    ok, msg, pushes = await asyncio.to_thread(core.create_by_discord, inter.user.id, str(inter.user), user, password, gender.value, age)
+    if not ok:
+        await inter.followup.send(msg, ephemeral=True)
+        return
+    _push_all(pushes)
+    name, phones = msg
+    log.info("/create by %s (%s): account %s, %d phone(s) logged in", inter.user, inter.user.id, name, phones)
+    e = discord.Embed(title=f"MP account created: {name}", color=0x2EA043,
+                      description="Your MP Multiplayer account is ready (the same one for the game, Moquil and MP Textdraw Editor).")
+    e.add_field(name="User", value=name)
+    e.add_field(name="Gender", value=gender.value)
+    e.add_field(name="Age", value=str(age))
+    e.add_field(name="Next", inline=False,
+                value=(f"Your phone that showed the /gen code is logged in by itself ({'now' if pushes else 'on the next game start'})."
+                       if phones else "In the game: join a login server and **Login** once with this username and password. "
+                                      "After that the phone stays logged in (MP/auth_service.txt), also after a restart or a rejoin."))
+    e.set_footer(text=f"MP bot {VERSION} · only you see this")
+    await inter.followup.send(embed=e, ephemeral=True)
+
+
+async def gh_save_loop():
+    """5.00.05: accounts.db to GitHub ~5-30 s after a change, and every 10 min anyway (only when it changed)."""
+    if not gh:
+        return
+    done, last = 0, time.time()
+    while True:
+        await asyncio.sleep(5)
+        try:
+            ch = core.changed
+            if (ch > done and time.time() - ch > 3 and time.time() - gh.last_save > 30) or time.time() - last > 600:
+                last, done = time.time(), ch
+                await asyncio.to_thread(gh.save, DB_PATH, "account change" if ch else "periodic")
+        except Exception as e:
+            log.warning("GitHub data save: %s", e)
 
 
 # ------------------------------------------------------------------ 4.13.16: /streaming (24/7 YouTube live in a voice channel)
@@ -654,6 +765,8 @@ async def on_ready():
         client._repush = asyncio.create_task(repush_loop())
     if not getattr(client, "_avatars", None):
         client._avatars = asyncio.create_task(avatar_loop())
+    if gh and not getattr(client, "_ghsave", None):
+        client._ghsave = asyncio.create_task(gh_save_loop())
     vstream.resume()
     if not getattr(client, "_stream", None) and STREAM_URL:
         client._stream = asyncio.create_task(stream_loop())
@@ -743,7 +856,7 @@ async def beacon():
             doc = {
                 "app": APP, "online": client.is_ready(), "ver": VERSION, "commit": COMMIT, "host": HOST_LABEL,
                 "bot": str(client.user) if client.user else "", "guilds": len(client.guilds),
-                "cmds": synced["cmds"] or ["/gen", "/stats", "/help", "/forgotuser", "/resetpass", "/streaming"], "login": core.ready,
+                "cmds": synced["cmds"] or ["/gen", "/create", "/stats", "/help", "/forgotuser", "/forgotpass", "/resetpass", "/streaming"], "login": core.ready,
                 "accounts": await asyncio.to_thread(core.account_count), "brokers": bridge.connected(),
                 "ping": round(client.latency * 1000) if client.latency == client.latency else -1,
                 "started": STARTED, "ts": int(time.time()), "py": platform.python_version(), "stream": STREAM_URL,
@@ -773,6 +886,11 @@ if __name__ == "__main__":
         log.error(why)
     finally:
         bridge.stop(why)
+        if gh:
+            try:
+                gh.save(DB_PATH, "bot stopped")
+            except Exception as e:
+                log.warning("GitHub data final save: %s", e)
     if why:
         time.sleep(60)
         raise SystemExit(why)

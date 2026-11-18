@@ -4,13 +4,14 @@ One workflow run = one ~5 h 40 min shift. The runner
   * restores accounts.db (AES-256-GCM encrypted with a key derived from AUTH_PRIVATE_KEY) from the
     "mp-railway-data" branch, so accounts survive between shifts,
   * starts main.py and restarts it if it crashes,
-  * saves the encrypted database back to that branch every 2 minutes when it changed,
+  * saves the encrypted database back to that branch ~10-30 s after an account change (5.00.05, ghstore.py:
+    never with fewer accounts than restored, never when the saved copy could not be read; every save is a
+    commit, so the branch history keeps every older copy),
   * auto deploys: a new commit on main is pulled and the bot restarted within 2 minutes,
   * near the end of the shift starts the next run (workflow_dispatch) and hands over.
 """
 import base64, hashlib, os, signal, sqlite3, subprocess, sys, tempfile, time, json, urllib.request
 
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 ROOT = os.getcwd()
 DATA_DIR = os.path.join(ROOT, "data")
@@ -19,7 +20,6 @@ BRANCH = "mp-railway-data"
 SHIFT = int(os.environ.get("SHIFT_SECONDS", str(5 * 3600 + 40 * 60)))
 REPO = os.environ.get("GITHUB_REPOSITORY", "")
 TOKEN = os.environ.get("GITHUB_TOKEN", "")
-KEY = hashlib.sha256(b"WAGU-DB1|" + os.environ.get("AUTH_PRIVATE_KEY", "").strip().lower().encode()).digest()
 started = time.time()
 stop = False
 
@@ -36,61 +36,26 @@ def sh(*cmd, check=True, cwd=None):
 
 
 # ------------------------------------------------------------------ encrypted DB on a branch
+# 5.00.05: ghstore.py (same file format as before): never overwrites the GitHub copy with fewer accounts,
+# never saves when the saved copy could not be read, and every save is a commit (history = backups).
+sys.path.insert(0, ROOT)
+import logging
+logging.basicConfig(level=logging.INFO, format="[mp-railway] %(message)s")
+from ghstore import GhStore
+
+store = GhStore(REPO, TOKEN, os.environ.get("AUTH_PRIVATE_KEY", ""), BRANCH)
+
+
 def restore():
     os.makedirs(DATA_DIR, exist_ok=True)
-    if sh("git", "ls-remote", "--heads", "origin", BRANCH, check=False) == "":
-        log("no saved database yet (first run)")
-        return
-    sh("git", "fetch", "-q", "--depth", "1", "origin", BRANCH)
-    blob = subprocess.run(["git", "show", f"FETCH_HEAD:accounts.db.enc"], capture_output=True).stdout
-    if not blob:
-        return
-    raw = base64.b64decode(blob)
-    plain = AESGCM(KEY).decrypt(raw[:12], raw[12:], b"accounts.db")
-    with open(DB, "wb") as f:
-        f.write(plain)
-    log(f"restored accounts.db ({len(plain)} bytes)")
-
-
-last_hash = None
+    log("restore:", store.restore(DB))
 
 
 def save(reason):
-    global last_hash
-    if not os.path.exists(DB):
-        return
-    tmp = tempfile.mktemp(suffix=".db")
     try:
-        src = sqlite3.connect(DB, timeout=10)
-        dst = sqlite3.connect(tmp)
-        src.backup(dst); dst.close(); src.close()   # consistent copy while the bot writes
-        plain = open(tmp, "rb").read()
-    finally:
-        if os.path.exists(tmp):
-            os.remove(tmp)
-    h = hashlib.sha256(plain).hexdigest()
-    if h == last_hash:
-        return
-    nonce = os.urandom(12)
-    enc = base64.b64encode(nonce + AESGCM(KEY).encrypt(nonce, plain, b"accounts.db"))
-    wt = tempfile.mkdtemp()
-    try:
-        sh("git", "init", "-q", wt)
-        with open(os.path.join(wt, "accounts.db.enc"), "wb") as f:
-            f.write(enc)
-        with open(os.path.join(wt, "README.md"), "w") as f:
-            f.write("MP Railway cloud runner data: accounts.db, AES-256-GCM encrypted (key from AUTH_PRIVATE_KEY). Do not edit.\n")
-        sh("git", "-C", wt, "add", "-A")
-        sh("git", "-C", wt, "-c", "user.name=mp-railway", "-c", "user.email=mp-railway@users.noreply.github.com",
-           "commit", "-q", "-m", f"accounts.db ({reason})")
-        url = f"https://x-access-token:{TOKEN}@github.com/{REPO}.git"
-        sh("git", "-C", wt, "push", "-q", "-f", url, f"HEAD:refs/heads/{BRANCH}")   # one commit, stays small
-        last_hash = h
-        log(f"saved accounts.db ({reason})")
+        store.save(DB, reason)
     except Exception as e:
         log("save failed:", e)
-    finally:
-        subprocess.run(["rm", "-rf", wt])
 
 
 # ------------------------------------------------------------------ bot process
@@ -99,7 +64,7 @@ bot = None
 
 def start_bot():
     global bot
-    env = dict(os.environ, DATA_DIR=DATA_DIR, MP_RAILWAY_APP="discordpy-bot",
+    env = dict(os.environ, DATA_DIR=DATA_DIR, MP_RAILWAY_APP="discordpy-bot", DATA_REPO_TOKEN="",   # the runner saves, not the bot
                MP_RAILWAY_HOST="MP Railway (cloud runner)",
                MP_RAILWAY_COMMIT=sh("git", "rev-parse", "HEAD"), PYTHONUNBUFFERED="1")
     bot = subprocess.Popen([sys.executable, "main.py"], cwd=ROOT, env=env)
@@ -156,8 +121,14 @@ restore()
 start_bot()
 queued = False
 last_check = time.time()
+last_mtime = os.path.getmtime(DB) if os.path.exists(DB) else 0
 while not stop and time.time() - started < SHIFT:
     time.sleep(5)
+    # 5.00.05: an account change (sign up, /create, /forgotpass, new phone) is on GitHub within ~10 s
+    mt = os.path.getmtime(DB) if os.path.exists(DB) else 0
+    if mt != last_mtime and time.time() - mt > 5 and time.time() - store.last_save > 30:
+        last_mtime = mt
+        save("account change")
     if bot.poll() is not None:
         log("bot exited with", bot.returncode, "- restarting in 5 s")
         time.sleep(5)
