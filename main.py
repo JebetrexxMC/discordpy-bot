@@ -473,7 +473,7 @@ CREATE_REPLIES = [
     f"Head to {_CH} to create a new account. After that the game keeps you logged in.",
     f"The bot makes your account in {_CH}. Type `/gen CODE` (code from the game) or `/create` there.",
 ]
-_ASK = re.compile(r"\b(how|paano|pano|panu|unsaon|unsay|unsa|asa|saan|where|can\s*i|pwede|help|pls|please|tulong|what|wat)\b", re.I)
+_ASK = re.compile(r"\b(how|paano|pano|panu|unsaon|unsay|unsa|asa|saan|where|can\s*i|pwede|help|pls|please|tulong|what|wat|cant|can.t|cannot|unable|hindi\s*ko|dili\s*ko)\b", re.I)
 _MAKE = re.compile(r"\b(create|creating|make|making|register|registration|sign\s*-?\s*up|gawa|gumawa|maggawa|himo|maghimo|buhat|mag\s*create|open|new|bago)\b", re.I)
 _ACC = re.compile(r"\b(acc|accs|account|accounts|acct|akawnt|akaun|user\s*name|username)\b", re.I)
 # "it's done": the account is already made -> no reply (and that person is left alone from then on)
