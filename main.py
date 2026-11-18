@@ -483,6 +483,8 @@ _DONE = re.compile(r"\b(done|created|made|finished|finally|success(ful)?|registe
                    r"thanks?|thank\s*you|salamat|ty)\b", re.I)
 _NOT_DONE = re.compile(r"\b(not|n't|cant|can't|cannot|unable|di|dili|wala|hindi|failed|error|why)\b", re.I)
 _last_reply = {"ch": {}, "user": {}, "i": -1, "done": set()}
+# live check for the status page: messages seen / with text (0 with text = Message Content not arriving), replies
+AUTO_STATS = {"seen": 0, "text": 0, "replies": 0, "last": 0, "portal": None}
 
 
 def _says_done(text):
@@ -505,6 +507,9 @@ def _is_create_question(text):
 async def on_message(msg: discord.Message):
     if msg.author.bot or not msg.guild or not AUTO_REPLY:
         return
+    AUTO_STATS["seen"] += 1
+    if msg.content:
+        AUTO_STATS["text"] += 1
     if str(msg.channel.id) == CREATE_CHANNEL:
         return
     text = msg.content or ""
@@ -535,6 +540,8 @@ async def on_message(msg: discord.Message):
                        f"That's the limit - in {_CH} use `/delete` first, then `/create` a new one."))
     try:
         await msg.reply(text_out, mention_author=False)
+        AUTO_STATS["replies"] += 1
+        AUTO_STATS["last"] = int(time.time())
         log.info("auto reply (create account) to %s in #%s", msg.author, getattr(msg.channel, "name", msg.channel.id))
     except discord.HTTPException as e:
         log.warning("auto reply: %s", e)
@@ -903,6 +910,13 @@ async def on_ready():
         client._repush = asyncio.create_task(repush_loop())
     if not getattr(client, "_avatars", None):
         client._avatars = asyncio.create_task(avatar_loop())
+    if AUTO_STATS["portal"] is None:
+        try:   # is Message Content on in the Developer Portal?
+            fl = (await client.application_info()).flags
+            AUTO_STATS["portal"] = bool(fl.gateway_message_content or fl.gateway_message_content_limited)
+            log.info("Message Content intent: portal %s, in use %s", "on" if AUTO_STATS["portal"] else "OFF", intents.message_content)
+        except Exception as e:
+            log.warning("application flags: %s", e)
     if gh and not getattr(client, "_ghsave", None):
         client._ghsave = asyncio.create_task(gh_save_loop())
     vstream.resume()
@@ -997,7 +1011,8 @@ async def beacon():
                 "cmds": synced["cmds"] or ["/gen", "/create", "/delete", "/stats", "/help", "/forgotuser", "/forgotpass", "/resetpass", "/streaming"], "login": core.ready,
                 "accounts": await asyncio.to_thread(core.account_count), "brokers": bridge.connected(),
                 "ping": round(client.latency * 1000) if client.latency == client.latency else -1,
-                "started": STARTED, "ts": int(time.time()), "py": platform.python_version(), "stream": STREAM_URL,
+                "started": STARTED, "ts": int(time.time()),
+                "content": bool(intents.message_content), "autoreply": AUTO_STATS, "py": platform.python_version(), "stream": STREAM_URL,
             }
             bridge.publish_status(doc)
         except Exception as e:
